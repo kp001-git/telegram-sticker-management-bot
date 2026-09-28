@@ -1,0 +1,6 @@
+.env
+venv/
+__pycache__/
+user_packs.json
+user_langs.json
+*.zip
