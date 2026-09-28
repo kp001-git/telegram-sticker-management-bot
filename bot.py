@@ -65,7 +65,8 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     t = TRANSLATIONS.get(lang, TRANSLATIONS['en'])
     
     keyboard = [
-        [InlineKeyboardButton(t['btn_channel'], url="https://t.me/souldumpp")],
+        [InlineKeyboardButton(t['btn_channel'], url="https://t.me/souldumpp"),
+         InlineKeyboardButton(t['btn_menu'], callback_data="menu_commands")],
         [InlineKeyboardButton(t['btn_lang'], callback_data="menu_lang"),
          InlineKeyboardButton(t['btn_about'], callback_data="menu_about")]
     ]
@@ -80,7 +81,13 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     lang = get_lang(user_id)
     t = TRANSLATIONS.get(lang, TRANSLATIONS['en'])
-    await context.bot.send_message(chat_id=update.effective_chat.id, text=t['help'])
+    
+    if update.callback_query:
+        keyboard = [[InlineKeyboardButton("🔙 Back", callback_data="menu_main")]]
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        await update.callback_query.edit_message_text(t['help'], reply_markup=reply_markup)
+    else:
+        await context.bot.send_message(chat_id=update.effective_chat.id, text=t['help'])
 
 async def about_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
@@ -122,6 +129,8 @@ async def menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await start_command(update, context)
     elif query.data == "menu_about":
         await about_command(update, context)
+    elif query.data == "menu_commands":
+        await help_command(update, context)
     elif query.data == "menu_lang":
         await lang_command(update, context)
     elif query.data.startswith("setlang_"):
