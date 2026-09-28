@@ -9,6 +9,8 @@ import random
 import asyncio
 import json
 import zipfile
+import threading
+from http.server import HTTPServer, BaseHTTPRequestHandler
 from io import BytesIO
 from PIL import Image
 from translations import TRANSLATIONS
@@ -875,6 +877,24 @@ if __name__ == '__main__':
     ))
     
     application.add_handler(CommandHandler('abort', abort_command))
+    
+    # --- RENDER FREE TIER HACK ---
+    # Render requires web services to bind to a port, otherwise it kills the process.
+    class DummyHandler(BaseHTTPRequestHandler):
+        def do_GET(self):
+            self.send_response(200)
+            self.send_header('Content-type', 'text/plain')
+            self.end_headers()
+            self.wfile.write(b"Sticker Bot is running!")
+
+    def start_dummy_server():
+        port = int(os.environ.get("PORT", 8080))
+        server = HTTPServer(('0.0.0.0', port), DummyHandler)
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        logger.info(f"Dummy web server listening on port {port}")
+
+    start_dummy_server()
+    # -----------------------------
     
     logger.info("Bot is starting...")
     application.run_polling()
