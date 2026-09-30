@@ -199,7 +199,7 @@ async def clonepack_receive_sticker(update: Update, context: ContextTypes.DEFAUL
         await update.message.reply_text("I couldn't find a valid pack. Please send a sticker or a valid t.me/addstickers/ link.")
         return WAITING_FOR_STICKER
     
-    await update.message.reply_text(f"Found the pack: {set_name}. Cloning has started! This might take a minute...")
+    status_msg = await update.message.reply_text(f"Found the pack: {set_name}. Cloning has started! This might take a minute...\n⏳ Please wait...")
     
     try:
         # Get the original sticker set
@@ -244,7 +244,7 @@ async def clonepack_receive_sticker(update: Update, context: ContextTypes.DEFAUL
                 )
                 break
             except RetryAfter as e:
-                await update.message.reply_text(f"Rate limited while creating pack. Waiting for {e.retry_after} seconds...")
+                logger.warning(f"Rate limited while creating pack. Waiting for {e.retry_after} seconds...")
                 await asyncio.sleep(e.retry_after + 1)
             except (TimedOut, NetworkError) as e:
                 logger.warning(f"Network error during pack creation: {e}. Retrying in 5 seconds...")
@@ -266,16 +266,13 @@ async def clonepack_receive_sticker(update: Update, context: ContextTypes.DEFAUL
                     )
                     break
                 except RetryAfter as e:
-                    await update.message.reply_text(f"Rate limited by Telegram. Waiting for {e.retry_after} seconds...")
+                    logger.warning(f"Rate limited by Telegram. Waiting for {e.retry_after} seconds...")
                     await asyncio.sleep(e.retry_after + 1)
                 except (TimedOut, NetworkError) as e:
                     logger.warning(f"Network error/timeout during upload: {e}. Retrying in 5 seconds...")
                     await asyncio.sleep(5)
             
             added_count += 1
-            if added_count % 10 == 0:
-                await update.message.reply_text(f"Cloned {added_count}/{len(sticker_set.stickers)} stickers...")
-                
             await asyncio.sleep(0.1) # Add a tiny delay
                 
         add_user_pack(update.effective_user.id, new_pack_name)
@@ -286,6 +283,7 @@ async def clonepack_receive_sticker(update: Update, context: ContextTypes.DEFAUL
         ]
         reply_markup = InlineKeyboardMarkup(keyboard)
         
+        await status_msg.delete()
         await update.message.reply_text(
             f"✅ Pack successfully cloned! ({added_count} stickers)\n"
             f"Here is your new pack: t.me/addstickers/{new_pack_name}",
@@ -293,6 +291,10 @@ async def clonepack_receive_sticker(update: Update, context: ContextTypes.DEFAUL
         )
     except Exception as e:
         logger.error(f"Error cloning pack: {e}")
+        try:
+            await status_msg.delete()
+        except:
+            pass
         await update.message.reply_text(f"Failed to clone the pack. Error: {e}")
         
     return ConversationHandler.END
