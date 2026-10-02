@@ -731,16 +731,48 @@ async def mix_finish(update: Update, context: ContextTypes.DEFAULT_TYPE):
         for s in stickers[:50]:
             input_stickers.append(InputSticker(s.file_id, [s.emoji or "👍"], format=sticker_format))
             
-        await context.bot.create_new_sticker_set(
-            user_id=user.id,
-            name=new_pack_name,
-            title=new_pack_title,
-            stickers=input_stickers,
-            sticker_type="regular",
-            read_timeout=120,
-            write_timeout=120,
-            connect_timeout=120
-        )
+        while True:
+            try:
+                await context.bot.create_new_sticker_set(
+                    user_id=user.id,
+                    name=new_pack_name,
+                    title=new_pack_title,
+                    stickers=input_stickers,
+                    sticker_type="regular",
+                    read_timeout=120,
+                    write_timeout=120,
+                    connect_timeout=120
+                )
+                break
+            except RetryAfter as e:
+                logger.warning(f"Rate limited while creating mixed pack. Waiting for {e.retry_after} seconds...")
+                await asyncio.sleep(e.retry_after + 1)
+            except (TimedOut, NetworkError) as e:
+                logger.warning(f"Network error during mixed pack creation: {e}. Retrying in 5 seconds...")
+                await asyncio.sleep(5)
+                
+        added_count = len(input_stickers)
+        
+        # Add the rest of the stickers one by one using file_ids (if there are > 50)
+        for s in stickers[50:]:
+            while True:
+                try:
+                    await context.bot.add_sticker_to_set(
+                        user_id=user.id,
+                        name=new_pack_name,
+                        sticker=InputSticker(s.file_id, [s.emoji or "👍"], format=sticker_format)
+                    )
+                    added_count += 1
+                    break
+                except RetryAfter as e:
+                    logger.warning(f"Rate limited while adding sticker to mix. Waiting for {e.retry_after} seconds...")
+                    await asyncio.sleep(e.retry_after + 1)
+                except (TimedOut, NetworkError) as e:
+                    logger.warning(f"Network error adding sticker to mix: {e}. Retrying in 5 seconds...")
+                    await asyncio.sleep(5)
+                except Exception as e:
+                    logger.error(f"Error adding sticker to mix: {e}")
+                    break
         
         add_user_pack(user.id, new_pack_name)
         
@@ -751,7 +783,7 @@ async def mix_finish(update: Update, context: ContextTypes.DEFAULT_TYPE):
         reply_markup = InlineKeyboardMarkup(keyboard)
         
         await message.reply_text(
-            f"✅ Mix successfully created! ({len(input_stickers)} stickers)\n"
+            f"✅ Mix successfully created! ({added_count} stickers)\n"
             f"Here is your new pack: t.me/addstickers/{new_pack_name}",
             reply_markup=reply_markup
         )
