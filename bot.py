@@ -10,6 +10,9 @@ import asyncio
 import json
 import zipfile
 import threading
+import math
+import tempfile
+import subprocess
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from io import BytesIO
 from PIL import Image
@@ -157,6 +160,14 @@ EDITSTICKER_EMOJI = 15
 MAKESTICKER_PHOTO = 16
 TOWHATSAPP_TARGET = 17
 
+MERGEPACK_PACK1 = 18
+MERGEPACK_PACK2 = 19
+APPENDPACK_DEST = 20
+APPENDPACK_SRC = 21
+
+MERGEPACK_CONFIRM_PARTIAL = 22
+APPENDPACK_CONFIRM_PARTIAL = 23
+
 async def clonepack_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     keyboard = [[InlineKeyboardButton("Cancel", callback_data="cancel_clone")]]
     reply_markup = InlineKeyboardMarkup(keyboard)
@@ -171,7 +182,9 @@ async def clonepack_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         
     return WAITING_FOR_STICKER
 
+
 async def cancel_clone_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+
     await update.callback_query.answer()
     await update.callback_query.edit_message_text("Cloning cancelled.")
     return ConversationHandler.END
@@ -190,13 +203,12 @@ async def clonepack_receive_sticker(update: Update, context: ContextTypes.DEFAUL
     elif update.message.text:
         text = update.message.text
         if "addstickers/" in text:
-            # Extract just the pack name from the URL
             set_name = text.split("addstickers/")[-1].split("?")[0].split("/")[0].strip()
         else:
             set_name = text.strip()
-            
+
     if not set_name:
-        await update.message.reply_text("I couldn't find a valid pack. Please send a sticker or a valid t.me/addstickers/ link.")
+        await update.message.reply_text("I couldn't find a valid pack. Please send a sticker, an emoji, or a valid link.")
         return WAITING_FOR_STICKER
     
     status_msg = await update.message.reply_text(f"Found the pack: {set_name}. Cloning has started! This might take a minute...\n⏳ Please wait...")
@@ -212,7 +224,7 @@ async def clonepack_receive_sticker(update: Update, context: ContextTypes.DEFAUL
         # Create a unique short name for the new pack
         random_string = ''.join(random.choices(string.ascii_lowercase + string.digits, k=5))
         new_pack_name = f"clone_{update.effective_user.id}_{random_string}_by_{bot_username}"
-        new_pack_title = f"{sticker_set.title} (Cloned)"
+        new_pack_title = f"{sticker_set.title[:50]} (Cloned)"
         
         # We can add up to 50 stickers in create_new_sticker_set
         max_initial_stickers = 50
@@ -794,6 +806,267 @@ async def mix_finish(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data['mix_stickers'] = []
     return ConversationHandler.END
 
+
+
+# --- MERGE PACKS FEATURE ---
+async def mergepacks_start(update, context):
+    await update.message.reply_text("Send me a sticker from the **FIRST** pack you want to merge. (Send /abort to cancel)", parse_mode="Markdown")
+    return MERGEPACK_PACK1
+
+async def mergepacks_receive_first(update, context):
+    context.user_data['merge_pack1'] = update.message.sticker.set_name
+    if not context.user_data['merge_pack1']:
+        await update.message.reply_text("That sticker doesn't belong to a pack. Try again.")
+        return MERGEPACK_PACK1
+    await update.message.reply_text("Got it! Now send me a sticker from the **SECOND** pack you want to merge.", parse_mode="Markdown")
+    return MERGEPACK_PACK2
+
+async def mergepacks_receive_second(update, context):
+    pack2_name = update.message.sticker.set_name
+    if not pack2_name:
+        await update.message.reply_text("That sticker doesn't belong to a pack. Try again.")
+        return MERGEPACK_PACK2
+        
+    pack1_name = context.user_data['merge_pack1']
+    
+    status_msg = await update.message.reply_text("Fetching packs and calculating... Please wait ⏳")
+    
+    try:
+        pack1 = await context.bot.get_sticker_set(pack1_name)
+        pack2 = await context.bot.get_sticker_set(pack2_name)
+        
+        all_stickers = list(pack1.stickers) + list(pack2.stickers)
+        
+        if len(all_stickers) > 120:
+            can_add = 120 - len(pack1.stickers)
+            context.user_data['merge_pack2_name'] = pack2_name
+            context.user_data['merge_pack2_limit'] = can_add
+            
+            keyboard = [
+                [InlineKeyboardButton(f"Merge {can_add} stickers", callback_data="merge_partial")],
+                [InlineKeyboardButton("Cancel", callback_data="cancel_merge_partial")]
+            ]
+            await status_msg.edit_text(
+                f"⚠️ The combined total is {len(all_stickers)} stickers, which exceeds the 120 limit.\n"
+                f"I can only add {can_add} stickers from the second pack. Do you want to proceed with a partial merge?",
+                reply_markup=InlineKeyboardMarkup(keyboard)
+            )
+            return MERGEPACK_CONFIRM_PARTIAL
+            
+        await status_msg.edit_text("Merging packs... Please wait ⏳")
+        return await _process_merge(update, context, pack1_name, pack2_name, len(pack2.stickers), status_msg)
+        
+    except Exception as e:
+        logger.error(f"Error merging packs: {e}")
+        await status_msg.edit_text(f"❌ Failed to process packs: {e}")
+        return ConversationHandler.END
+
+async def mergepacks_confirm_partial(update, context):
+    query = update.callback_query
+    await query.answer()
+    
+    if query.data == "cancel_merge_partial":
+        await query.edit_message_text("❌ Merge cancelled.")
+        return ConversationHandler.END
+        
+    pack1_name = context.user_data['merge_pack1']
+    pack2_name = context.user_data['merge_pack2_name']
+    limit = context.user_data['merge_pack2_limit']
+    
+    await query.edit_message_text("Merging packs partially... Please wait ⏳")
+    return await _process_merge(update, context, pack1_name, pack2_name, limit, query.message)
+
+async def _process_merge(update, context, pack1_name, pack2_name, limit2, status_msg):
+    try:
+        pack1 = await context.bot.get_sticker_set(pack1_name)
+        pack2 = await context.bot.get_sticker_set(pack2_name)
+        
+        all_stickers = list(pack1.stickers) + list(pack2.stickers)[:limit2]
+            
+        bot_info = await context.bot.get_me()
+        random_string = ''.join(random.choices(string.ascii_lowercase + string.digits, k=5))
+        new_pack_name = f"merge_{update.effective_user.id if update.message else update.callback_query.from_user.id}_{random_string}_by_{bot_info.username}"
+        new_pack_title = f"Merged Pack {random_string}"
+        
+        first_sticker = all_stickers[0]
+        sticker_format = "animated" if first_sticker.is_animated else ("video" if first_sticker.is_video else "static")
+        
+        input_stickers = []
+        for s in all_stickers[:50]:
+            input_stickers.append(InputSticker(s.file_id, [s.emoji or "👍"], format=sticker_format))
+            
+        while True:
+            try:
+                await context.bot.create_new_sticker_set(
+                    user_id=update.effective_user.id if update.message else update.callback_query.from_user.id,
+                    name=new_pack_name,
+                    title=new_pack_title,
+                    stickers=input_stickers,
+                    sticker_type="regular",
+                    read_timeout=120,
+                    write_timeout=120,
+                    connect_timeout=120
+                )
+                break
+            except RetryAfter as e:
+                await asyncio.sleep(e.retry_after + 1)
+            except (TimedOut, NetworkError) as e:
+                await asyncio.sleep(5)
+                
+        added_count = len(input_stickers)
+        for s in all_stickers[50:]:
+            while True:
+                try:
+                    await context.bot.add_sticker_to_set(
+                        user_id=update.effective_user.id if update.message else update.callback_query.from_user.id,
+                        name=new_pack_name,
+                        sticker=InputSticker(s.file_id, [s.emoji or "👍"], format=sticker_format)
+                    )
+                    added_count += 1
+                    break
+                except RetryAfter as e:
+                    await asyncio.sleep(e.retry_after + 1)
+                except (TimedOut, NetworkError) as e:
+                    await asyncio.sleep(5)
+                    
+        add_user_pack(update.effective_user.id if update.message else update.callback_query.from_user.id, new_pack_name)
+        
+        keyboard = [[InlineKeyboardButton("Open Merged Pack", url=f"https://t.me/addstickers/{new_pack_name}")]]
+        await status_msg.delete()
+        if update.message:
+            await update.message.reply_text(
+                f"✅ Packs successfully merged! ({added_count} stickers)\nHere is your new pack: t.me/addstickers/{new_pack_name}",
+                reply_markup=InlineKeyboardMarkup(keyboard)
+            )
+        else:
+            await update.callback_query.message.reply_text(
+                f"✅ Packs successfully merged! ({added_count} stickers)\nHere is your new pack: t.me/addstickers/{new_pack_name}",
+                reply_markup=InlineKeyboardMarkup(keyboard)
+            )
+    except Exception as e:
+        logger.error(f"Error merging packs: {e}")
+        await status_msg.edit_text(f"❌ Failed to merge packs: {e}")
+        
+    return ConversationHandler.END
+
+
+# --- APPEND PACK FEATURE ---
+async def appendpack_start(update, context):
+    await update.message.reply_text("Send me a sticker from the **DESTINATION** pack (must be a pack created by me!). Send /abort to cancel.", parse_mode="Markdown")
+    return APPENDPACK_DEST
+
+async def appendpack_receive_dest(update, context):
+    pack_name = update.message.sticker.set_name
+    if not pack_name:
+        await update.message.reply_text("That sticker doesn't belong to a pack. Try again.")
+        return APPENDPACK_DEST
+        
+    bot_info = await context.bot.get_me()
+    if not pack_name.endswith(f"_by_{bot_info.username}"):
+        await update.message.reply_text(f"❌ I can only add stickers to packs that I created (names ending in _by_{bot_info.username}). Try another one.")
+        return APPENDPACK_DEST
+        
+    context.user_data['append_dest_pack'] = pack_name
+    await update.message.reply_text("Got it! Now send me a sticker from the **SOURCE** pack you want to append to it.", parse_mode="Markdown")
+    return APPENDPACK_SRC
+
+async def appendpack_receive_src(update, context):
+    src_pack_name = update.message.sticker.set_name
+    if not src_pack_name:
+        await update.message.reply_text("That sticker doesn't belong to a pack. Try again.")
+        return APPENDPACK_SRC
+        
+    dest_pack_name = context.user_data['append_dest_pack']
+    status_msg = await update.message.reply_text("Fetching packs and calculating... Please wait ⏳")
+    
+    try:
+        dest_pack = await context.bot.get_sticker_set(dest_pack_name)
+        src_pack = await context.bot.get_sticker_set(src_pack_name)
+        
+        total_len = len(dest_pack.stickers) + len(src_pack.stickers)
+        if total_len > 120:
+            can_add = 120 - len(dest_pack.stickers)
+            if can_add <= 0:
+                await status_msg.edit_text("❌ Cannot append! The destination pack is already full (120 stickers).")
+                return ConversationHandler.END
+                
+            context.user_data['append_src_pack'] = src_pack_name
+            context.user_data['append_limit'] = can_add
+            
+            keyboard = [
+                [InlineKeyboardButton(f"Append {can_add} stickers", callback_data="append_partial")],
+                [InlineKeyboardButton("Cancel", callback_data="cancel_append_partial")]
+            ]
+            await status_msg.edit_text(
+                f"⚠️ The destination pack already has {len(dest_pack.stickers)} stickers. Adding the full pack would exceed the 120 limit.\n"
+                f"I can only add {can_add} more stickers. Do you want to proceed partially?",
+                reply_markup=InlineKeyboardMarkup(keyboard)
+            )
+            return APPENDPACK_CONFIRM_PARTIAL
+            
+        await status_msg.edit_text("Appending packs... Please wait ⏳")
+        return await _process_append(update, context, dest_pack_name, src_pack_name, len(src_pack.stickers), status_msg)
+    
+    except Exception as e:
+        logger.error(f"Error appending packs: {e}")
+        await status_msg.edit_text(f"❌ Failed to process packs: {e}")
+        return ConversationHandler.END
+
+async def appendpack_confirm_partial(update, context):
+    query = update.callback_query
+    await query.answer()
+    
+    if query.data == "cancel_append_partial":
+        await query.edit_message_text("❌ Append cancelled.")
+        return ConversationHandler.END
+        
+    dest_pack_name = context.user_data['append_dest_pack']
+    src_pack_name = context.user_data['append_src_pack']
+    limit = context.user_data['append_limit']
+    
+    await query.edit_message_text("Appending packs partially... Please wait ⏳")
+    return await _process_append(update, context, dest_pack_name, src_pack_name, limit, query.message)
+
+async def _process_append(update, context, dest_pack_name, src_pack_name, limit, status_msg):
+    try:
+        src_pack = await context.bot.get_sticker_set(src_pack_name)
+        first_sticker = src_pack.stickers[0]
+        sticker_format = "animated" if first_sticker.is_animated else ("video" if first_sticker.is_video else "static")
+        
+        added_count = 0
+        for s in list(src_pack.stickers)[:limit]:
+            while True:
+                try:
+                    await context.bot.add_sticker_to_set(
+                        user_id=update.effective_user.id if update.message else update.callback_query.from_user.id,
+                        name=dest_pack_name,
+                        sticker=InputSticker(s.file_id, [s.emoji or "👍"], format=sticker_format)
+                    )
+                    added_count += 1
+                    break
+                except RetryAfter as e:
+                    await asyncio.sleep(e.retry_after + 1)
+                except (TimedOut, NetworkError) as e:
+                    await asyncio.sleep(5)
+                    
+        keyboard = [[InlineKeyboardButton("Open Updated Pack", url=f"https://t.me/addstickers/{dest_pack_name}")]]
+        await status_msg.delete()
+        if update.message:
+            await update.message.reply_text(
+                f"✅ Pack successfully appended! Added {added_count} stickers.\nHere is your updated pack: t.me/addstickers/{dest_pack_name}",
+                reply_markup=InlineKeyboardMarkup(keyboard)
+            )
+        else:
+            await update.callback_query.message.reply_text(
+                f"✅ Pack successfully appended! Added {added_count} stickers.\nHere is your updated pack: t.me/addstickers/{dest_pack_name}",
+                reply_markup=InlineKeyboardMarkup(keyboard)
+            )
+    except Exception as e:
+        logger.error(f"Error appending packs: {e}")
+        await status_msg.edit_text(f"❌ Failed to append packs: {e}")
+        
+    return ConversationHandler.END
+
 async def cancel_mix_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.callback_query.answer()
     await update.callback_query.edit_message_text("Mix cancelled.")
@@ -817,7 +1090,7 @@ if __name__ == '__main__':
         ],
         states={
             WAITING_FOR_STICKER: [
-                MessageHandler(filters.Sticker.ALL | filters.TEXT, clonepack_receive_sticker),
+                MessageHandler(filters.Sticker.ALL | (filters.TEXT & ~filters.COMMAND), clonepack_receive_sticker),
                 CallbackQueryHandler(cancel_clone_callback, pattern='^cancel_clone$')
             ]
         },
@@ -919,6 +1192,30 @@ if __name__ == '__main__':
         fallbacks=[CommandHandler('abort', abort_command)]
     ))
     
+    
+
+    application.add_handler(ConversationHandler(
+        entry_points=[CommandHandler('mergepacks', mergepacks_start)],
+        states={
+            MERGEPACK_PACK1: [MessageHandler(filters.Sticker.ALL, mergepacks_receive_first)],
+            MERGEPACK_PACK2: [MessageHandler(filters.Sticker.ALL, mergepacks_receive_second)],
+            MERGEPACK_CONFIRM_PARTIAL: [CallbackQueryHandler(mergepacks_confirm_partial, pattern='^(merge_partial|cancel_merge_partial)$')]
+        },
+        fallbacks=[CommandHandler('abort', abort_command)]
+    ))
+
+
+    application.add_handler(ConversationHandler(
+        entry_points=[CommandHandler('appendpack', appendpack_start)],
+        states={
+            APPENDPACK_DEST: [MessageHandler(filters.Sticker.ALL, appendpack_receive_dest)],
+            APPENDPACK_SRC: [MessageHandler(filters.Sticker.ALL, appendpack_receive_src)],
+            APPENDPACK_CONFIRM_PARTIAL: [CallbackQueryHandler(appendpack_confirm_partial, pattern='^(append_partial|cancel_append_partial)$')]
+        },
+        fallbacks=[CommandHandler('abort', abort_command)]
+    ))
+
+
     application.add_handler(CommandHandler('abort', abort_command))
     
     # --- RENDER FREE TIER HACK ---
